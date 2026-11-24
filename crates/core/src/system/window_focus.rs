@@ -11,7 +11,7 @@ const FOCUS_CONFIRMATIONS: u8 = 2;
 /// Focuses the window and returns it with how far the focus got. A dispatch
 /// the adapter reports as sent becomes verified only after this confirmation
 /// observes the window focused; one that sent nothing stays not-delivered even
-/// when the window is now focused.
+/// when the window is now focused or the confirmation itself fails.
 pub(crate) fn focus_and_confirm(
     adapter: &dyn PlatformAdapter,
     window: &WindowInfo,
@@ -35,13 +35,13 @@ pub(crate) fn focus_and_confirm(
 }
 
 fn stamp_failed_confirmation(error: AppError, dispatch: DeliverySemantics) -> AppError {
-    if dispatch == DeliverySemantics::not_delivered() {
-        return error;
-    }
+    let disposition = if dispatch == DeliverySemantics::not_delivered() {
+        DeliverySemantics::not_delivered()
+    } else {
+        DeliverySemantics::delivered_unverified()
+    };
     match error {
-        AppError::Adapter(error) => {
-            AppError::Adapter(error.with_disposition(DeliverySemantics::delivered_unverified()))
-        }
+        AppError::Adapter(error) => AppError::Adapter(error.with_disposition(disposition)),
         other => other,
     }
 }

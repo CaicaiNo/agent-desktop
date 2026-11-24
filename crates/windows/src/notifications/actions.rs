@@ -209,10 +209,21 @@ fn invoke_notification_action(
 pub(super) fn invoke_element(element: &UIAElement) -> Result<(), AdapterError> {
     use uiautomation::patterns::UIInvokePattern;
 
-    let pattern: UIInvokePattern = element
-        .0
-        .get_pattern()
-        .map_err(|error| crate::tree::automation::uia_error(&error, "read the Invoke pattern"))?;
+    invoke_pattern(element.0.get_pattern::<UIInvokePattern>())
+}
+
+/// Invokes an already-claimed Invoke pattern, or reports why claiming it failed.
+///
+/// Acquiring the pattern is a read: nothing reached the application, so its
+/// failure is stamped not-delivered and never counts as a dispatch. Only the
+/// `invoke()` failure itself stays uncertain.
+#[cfg(target_os = "windows")]
+pub(super) fn invoke_pattern(
+    pattern: Result<uiautomation::patterns::UIInvokePattern, uiautomation::Error>,
+) -> Result<(), AdapterError> {
+    let pattern = pattern.map_err(|error| {
+        crate::tree::automation::uia_error(&error, "read the Invoke pattern").unsent()
+    })?;
     pattern.invoke().map_err(|error| {
         crate::tree::automation::uia_error(&error, "invoke a notification control")
     })
