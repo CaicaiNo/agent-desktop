@@ -1,6 +1,8 @@
 use super::{AXElement, properties::element::element_for_pid, surface_read};
 use agent_desktop_core::{AdapterError, Deadline, ErrorCode, SnapshotSurface, WindowInfo};
 
+use crate::system::process::process_identity::ProcessIdentity;
+
 #[cfg(target_os = "macos")]
 pub(crate) fn focused_surface_for_pid(
     pid: i32,
@@ -24,14 +26,12 @@ pub(crate) fn menu_element_for_pid(
 
 /// The menu or popover the application shows, read in one bounded pass.
 #[cfg(target_os = "macos")]
-pub(crate) fn transient_surface_for_pid(
-    pid: i32,
+pub(crate) fn transient_surface_for_process(
+    identity: ProcessIdentity,
     deadline: Deadline,
 ) -> Result<Option<AXElement>, AdapterError> {
-    let identity = crate::system::process::process_identity::ProcessIdentity::capture(pid)?
-        .ok_or_else(|| AdapterError::stale_ref_because("Application exited"))?;
     super::app_menu::observe(identity, deadline, || {
-        super::app_menu::open_transient_surface(pid, deadline)
+        super::app_menu::open_transient_surface(identity.pid(), deadline)
     })
 }
 
@@ -40,33 +40,29 @@ pub(crate) fn transient_surface_for_pid(
 /// surface in a window that is not focused is still found.
 #[cfg(target_os = "macos")]
 pub(crate) fn transient_surface_for_window(
-    pid: i32,
+    identity: ProcessIdentity,
     window: &WindowInfo,
     deadline: Deadline,
 ) -> Result<Option<AXElement>, AdapterError> {
-    let identity = crate::system::process::process_identity::ProcessIdentity::capture(pid)?
-        .ok_or_else(|| AdapterError::stale_ref_because("Application exited"))?;
     super::app_menu::observe(identity, deadline, || {
-        match surface_inside_window(window, deadline)? {
-            Some(surface) => Ok(Some(surface)),
-            None => super::app_menu::open_transient_surface(pid, deadline),
+        if let Some(surface) = surface_inside_window(window, deadline)? {
+            return Ok(Some(surface));
         }
+        super::app_menu::require_generation(identity)?;
+        super::app_menu::open_transient_surface(identity.pid(), deadline)
     })
 }
 
 /// The menu or popover inside `window`, searched at any depth because a
-/// popover hangs below the control that raised it. A window whose accessibility
-/// element cannot be read is left to the application's own surfaces.
+/// popover hangs below the control that raised it.
 #[cfg(target_os = "macos")]
 fn surface_inside_window(
     window: &WindowInfo,
     deadline: Deadline,
 ) -> Result<Option<AXElement>, AdapterError> {
-    let Ok(owner) = crate::system::window::window_resolve::window_element_for_info_with_deadline(
+    let owner = crate::system::window::window_resolve::window_element_for_info_with_deadline(
         window, deadline,
-    ) else {
-        return Ok(None);
-    };
+    )?;
     Ok(super::app_menu::find_menu_descendant(
         owner,
         "window".into(),
@@ -141,11 +137,7 @@ fn popover_in_window(
 }
 
 fn popover_search_error(error: AdapterError) -> AdapterError {
-    let cut = error
-        .details
-        .as_ref()
-        .is_some_and(|details| details["kind"] == "surface_search_limit");
-    if !cut {
+    if !super::app_menu::is_surface_search_limit(&error) {
         return error;
     }
     popover_search_cut()

@@ -12,33 +12,38 @@
 //! owner exists in the target window; otherwise the refusal stays as it was.
 //! The owner's reply is the answer, so a rejected action delivers nothing and
 //! an owner that does not answer leaves the delivery uncertain; the key
-//! route's refusal replaces neither.
+//! route's refusal replaces neither. Every stage re-checks that the element
+//! still belongs to the original process instance, so a recycled process id
+//! never receives the dismissal.
 
 use std::time::Duration;
 
 use agent_desktop_core::{
-    Action, ActionResult, AdapterError, ChainRung, Deadline, DeliveryOutcome, KeyCombo,
-    StepMechanism, WindowInfo,
+    Action, ActionResult, AdapterError, ChainRung, Deadline, DeliveryOutcome, DeliverySemantics,
+    KeyCombo, ProcessIdentity, StepMechanism, WindowInfo,
 };
 
-use crate::actions::action_call::{do_action, resolve_verb};
+use crate::actions::action_call::resolve_verb;
 use crate::actions::chain::run_semantic_chain;
-use crate::actions::context::Target;
+use crate::actions::process_check::{judge_frame, judge_owner};
 use crate::actions::write::mutation::WriteReply;
+use crate::system::process::process_facts;
+use crate::system::process::process_lookup::Lookup;
 use crate::system::window::window_id;
-use crate::system::window::window_ops::windows_of_process;
-use crate::system::{REGISTRY_ROOT_PATH, SharedBus, within};
-use crate::tree::menu::observe_menu::{rooted, scan_walk_structure};
-use crate::tree::properties::toolkit_trust::{ToolkitKind, kind, read_toolkit};
+use crate::system::{SharedBus, owner_process_id, within};
+use crate::tree::menu::observe_menu::rooted;
+use crate::tree::properties::toolkit_trust::ToolkitKind;
 use crate::tree::vocabulary::role_numbers::{
     COMBO_BOX, MENU, POPUP_MENU, PUSH_BUTTON, PUSH_BUTTON_MENU, TOGGLE_BUTTON, is_web_document,
 };
 use crate::tree::vocabulary::state_bits::{HAS_POPUP, SHOWING, StateBits};
-use crate::tree::{AtspiElement, ObservedRead, WalkedNode, get_live_actions};
+use crate::tree::{AtspiElement, ObservedRead, WalkedNode};
 
-const SCAN_NODES: usize = 600;
-const OWNER_NODES: usize = 64;
-const POPUP_CONTAINER_CHILDREN: usize = 16;
+#[path = "escape_popup_world.rs"]
+mod world;
+
+use world::PopupWorld;
+
 const CLOSE_SETTLE: Duration = Duration::from_millis(1000);
 const CLOSE_STEP: Duration = Duration::from_millis(50);
 const FOCUS_CHECKS: [&str; 2] = ["window_active", "exact_window_focus"];
@@ -128,45 +133,88 @@ pub(super) fn deepest_open_owner<'a>(
     }
 }
 
-fn frames_of(
-    bus: &SharedBus,
+fn not_delivered(error: AdapterError) -> AdapterError {
+    error.with_disposition(DeliverySemantics::not_delivered())
+}
+
+/// Refuses a live process table that no longer names the original instance,
+/// so a recycled process id never receives the dismissal.
+fn verify_live_process(expected: &ProcessIdentity, live: &Lookup) -> Result<(), AdapterError> {
+    judge_frame(expected, expected.pid.get(), live).map_err(not_delivered)
+}
+
+/// Refuses a window recorded for another process or for another generation of
+/// the target process.
+fn verify_window_identity(
+    expected: &ProcessIdentity,
+    window: &WindowInfo,
+) -> Result<(), AdapterError> {
+    let same_instance = window.process_instance.as_deref() == Some(expected.instance.as_str());
+    if window.pid == expected.pid && same_instance {
+        return Ok(());
+    }
+    Err(not_delivered(AdapterError::stale_ref_because(
+        "The window no longer belongs to the target process instance, so no popup was closed",
+    )))
+}
+
+fn verify_element_pid(
+    expected: &ProcessIdentity,
     pid: u32,
+    live: &Lookup,
+) -> Result<(), AdapterError> {
+    judge_frame(expected, pid, live).map_err(not_delivered)
+}
+
+/// Refuses an element whose frame or address names another process, or whose
+/// bus name the bus daemon now reports for another process.
+fn verify_element_owner(
+    bus: &SharedBus,
+    expected: &ProcessIdentity,
+    element: &AtspiElement,
+    deadline: Deadline,
+) -> Result<(), AdapterError> {
+    let live = process_facts::lookup(expected.pid.get());
+    let frame_pid = element.frame().map_or(element.pid(), AtspiElement::pid);
+    verify_element_pid(expected, frame_pid, &live)?;
+    verify_element_pid(expected, element.pid(), &live)?;
+    let connection = bus.get(deadline).map_err(not_delivered)?;
+    let owner = within(deadline, async {
+        Ok(owner_process_id(connection.inner(), element.bus_name())
+            .await
+            .map_err(Some))
+    })
+    .map_err(not_delivered)?;
+    judge_owner(expected.pid.get(), owner).map_err(not_delivered)?;
+    verify_live_process(expected, &process_facts::lookup(expected.pid.get()))
+}
+
+fn frames_of(
+    world: &impl PopupWorld,
+    process: &ProcessIdentity,
     window: Option<&WindowInfo>,
     deadline: Deadline,
 ) -> Result<Vec<AtspiElement>, AdapterError> {
     let windows = match window {
         Some(window) => vec![window.clone()],
-        None => windows_of_process(bus, pid, deadline)?.0,
+        None => {
+            let windows = world.windows(process.pid.get(), deadline)?;
+            verify_live_process(process, &world.live(process.pid.get()))?;
+            for window in &windows {
+                verify_window_identity(process, window)?;
+            }
+            windows
+        }
     };
-    let mut frames = Vec::new();
-    for window in windows {
-        let (name, path) = window_id::decode(&window.id)?;
-        frames.push(rooted(&AtspiElement::new(name, path, pid)));
-    }
-    Ok(frames)
+    windows
+        .into_iter()
+        .map(|window| frame_of(&window, process.pid.get()))
+        .collect()
 }
 
-fn owner_toolkit(bus: &SharedBus, owner: &AtspiElement, deadline: Deadline) -> ToolkitKind {
-    let Ok(connection) = bus.get(deadline) else {
-        return ToolkitKind::Other;
-    };
-    let app = AtspiElement::new(owner.bus_name(), REGISTRY_ROOT_PATH, owner.pid());
-    match within(deadline, read_toolkit(connection.inner(), &app)) {
-        Ok(toolkit) => kind(&toolkit),
-        Err(_) => ToolkitKind::Other,
-    }
-}
-
-fn still_open(bus: &SharedBus, owner: &AtspiElement, deadline: Deadline) -> Option<bool> {
-    let walk = scan_walk_structure(
-        bus,
-        &rooted(owner),
-        OWNER_NODES,
-        Some(POPUP_CONTAINER_CHILDREN),
-        deadline,
-    )
-    .ok()?;
-    popup_open(&walk)
+fn frame_of(window: &WindowInfo, pid: u32) -> Result<AtspiElement, AdapterError> {
+    let (name, path) = window_id::decode(&window.id)?;
+    Ok(rooted(&AtspiElement::new(name, path, pid)))
 }
 
 /// Whether the owner's popup is open, read after a dismissal. `None` when the
@@ -216,20 +264,31 @@ pub(super) fn popup_answer(
 /// result, the popup attempt's own failure included, is the answer.
 pub(super) fn close_open_popup(
     bus: &SharedBus,
-    pid: u32,
+    process: &ProcessIdentity,
     window: Option<&WindowInfo>,
     combo: &KeyCombo,
     deadline: Deadline,
 ) -> Result<Option<ActionResult>, AdapterError> {
+    close_popup_with(bus, process, window, combo, deadline)
+}
+
+fn close_popup_with(
+    world: &impl PopupWorld,
+    process: &ProcessIdentity,
+    window: Option<&WindowInfo>,
+    combo: &KeyCombo,
+    deadline: Deadline,
+) -> Result<Option<ActionResult>, AdapterError> {
+    verify_live_process(process, &world.live(process.pid.get()))?;
+    if let Some(window) = window {
+        verify_window_identity(process, window)?;
+    }
     let mut best: Option<(usize, AtspiElement, Option<u32>)> = None;
-    for frame in frames_of(bus, pid, window, deadline)? {
-        let walk = scan_walk_structure(
-            bus,
-            &frame,
-            SCAN_NODES,
-            Some(POPUP_CONTAINER_CHILDREN),
-            deadline,
-        )?;
+    for frame in frames_of(world, process, window, deadline).map_err(not_delivered)? {
+        world
+            .verify_owner(process, &frame, deadline)
+            .map_err(not_delivered)?;
+        let walk = world.walk(&frame, deadline).map_err(not_delivered)?;
         let mut found = None;
         deepest_open_owner(&walk, 0, &mut found);
         if let Some((depth, node)) = found
@@ -241,25 +300,25 @@ pub(super) fn close_open_popup(
     let Some((_, owner, owner_role)) = best else {
         return Ok(None);
     };
-    let verbs = close_verbs(owner_role, owner_toolkit(bus, &owner, deadline));
-    let handle = owner.clone().into_native_handle();
-    let names = get_live_actions(bus, &handle, deadline)?.unwrap_or_default();
+    world
+        .verify_owner(process, &owner, deadline)
+        .map_err(not_delivered)?;
+    let (names, verbs) = world
+        .verbs(&owner, owner_role, deadline)
+        .map_err(not_delivered)?;
     if resolve_verb(&names, verbs).is_none() {
         return Ok(None);
     }
     let run = || {
-        let target = Target {
-            bus,
-            handle: &handle,
-            element: &owner,
-            deadline,
-        };
-        let reply = do_action(&target, &names, verbs)?;
+        world
+            .verify_owner(process, &owner, deadline)
+            .map_err(not_delivered)?;
+        let reply = world.dismiss(&owner, &names, verbs, deadline)?;
         Ok(popup_outcome(reply, || {
             deadline.poll_until(
                 CLOSE_SETTLE,
                 CLOSE_STEP,
-                || still_open(bus, &owner, deadline).map(|open| !open),
+                || world.popup_still_open(&owner, deadline).map(|open| !open),
                 |closed| *closed == Some(true),
             )
         }))
@@ -278,6 +337,10 @@ pub(super) fn close_open_popup(
     )
     .map(Some)
 }
+
+#[cfg(test)]
+#[path = "escape_popup_stage_tests.rs"]
+mod stage_tests;
 
 #[cfg(test)]
 #[path = "escape_popup_tests.rs"]

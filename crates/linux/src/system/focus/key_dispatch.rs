@@ -212,7 +212,7 @@ fn press_in(
 fn closing_popup_when_refused(
     result: Result<ActionResult, AdapterError>,
     bus: &SharedBus,
-    target: (u32, Option<&WindowInfo>),
+    target: (&ProcessIdentity, Option<&WindowInfo>),
     combo: &KeyCombo,
     deadline: Deadline,
 ) -> Result<ActionResult, AdapterError> {
@@ -234,7 +234,6 @@ pub(crate) fn press_key_for_app(
 ) -> Result<ActionResult, AdapterError> {
     crate::system::display::display_server::require(lease.deadline())
         .map_err(|error| error.with_disposition(DeliverySemantics::not_delivered()))?;
-    let pid = process.pid.get();
     let result = press_in(Press {
         physical: &LiveWorld { bus, lease },
         keys: &LiveKeys { bus },
@@ -244,7 +243,7 @@ pub(crate) fn press_key_for_app(
         policy,
         deadline: lease.deadline(),
     });
-    closing_popup_when_refused(result, bus, (pid, None), combo, lease.deadline())
+    closing_popup_when_refused(result, bus, (&process, None), combo, lease.deadline())
 }
 
 pub(crate) fn press_key_for_window(
@@ -261,10 +260,11 @@ pub(crate) fn press_key_for_window(
         .as_deref()
         .filter(|instance| !instance.is_empty())
         .ok_or_else(|| window_not_active(window))?;
+    let process = ProcessIdentity::new(window.pid, instance);
     let result = press_in(Press {
         physical: &LiveWorld { bus, lease },
         keys: &LiveKeys { bus },
-        process: &ProcessIdentity::new(window.pid, instance),
+        process: &process,
         window: Some(window),
         combo,
         policy,
@@ -273,7 +273,7 @@ pub(crate) fn press_key_for_window(
     closing_popup_when_refused(
         result,
         bus,
-        (window.pid.get(), Some(window)),
+        (&process, Some(window)),
         combo,
         lease.deadline(),
     )
