@@ -1,5 +1,7 @@
 use super::{AXElement, properties::element::element_for_pid, surface_read};
-use agent_desktop_core::{AdapterError, Deadline, ErrorCode, SnapshotSurface};
+use agent_desktop_core::{AdapterError, Deadline, ErrorCode, SnapshotSurface, WindowInfo};
+
+use crate::system::process::process_identity::ProcessIdentity;
 
 #[cfg(target_os = "macos")]
 pub(crate) fn focused_surface_for_pid(
@@ -24,27 +26,33 @@ pub(crate) fn menu_element_for_pid(
 
 /// The menu or popover the application shows, read in one bounded pass.
 #[cfg(target_os = "macos")]
-pub(crate) fn transient_surface_for_pid(
-    pid: i32,
+pub(crate) fn transient_surface_for_process(
+    identity: ProcessIdentity,
     deadline: Deadline,
 ) -> Result<Option<AXElement>, AdapterError> {
-    let identity = crate::system::process::process_identity::ProcessIdentity::capture(pid)?
-        .ok_or_else(|| AdapterError::stale_ref_because("Application exited"))?;
     super::app_menu::observe(identity, deadline, || {
-        super::app_menu::open_transient_surface(pid, deadline)
+        super::app_menu::open_transient_surface(identity.pid(), deadline)
     })
 }
 
-/// The menu or popover inside `window`, read in one bounded pass.
+/// The menu or popover inside `window`, searched at any depth because a popover
+/// hangs below the control that raised it. The window is resolved inside the
+/// observed pass, so a window that is gone and a process that was replaced both
+/// fail instead of reading as an absent surface.
 #[cfg(target_os = "macos")]
 pub(crate) fn transient_surface_in_window(
-    window: &AXElement,
+    identity: ProcessIdentity,
+    window: &WindowInfo,
     deadline: Deadline,
 ) -> Result<Option<AXElement>, AdapterError> {
-    Ok(
-        super::app_menu::find_transient_surface(window.clone(), "window".into(), deadline)?
-            .map(|(_, surface)| surface),
-    )
+    super::app_menu::observe(identity, deadline, || {
+        let owner =
+            crate::system::window::window_resolve::window_element_for_info(window, deadline)?;
+        Ok(
+            super::app_menu::find_transient_surface(owner, "window".into(), deadline)?
+                .map(|(_, surface)| surface),
+        )
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -112,11 +120,7 @@ fn popover_in_window(
 }
 
 fn popover_search_error(error: AdapterError) -> AdapterError {
-    let cut = error
-        .details
-        .as_ref()
-        .is_some_and(|details| details["kind"] == "surface_search_limit");
-    if !cut {
+    if !super::app_menu::is_surface_search_limit(&error) {
         return error;
     }
     popover_search_cut()
