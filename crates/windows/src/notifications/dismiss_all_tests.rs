@@ -1,6 +1,8 @@
 use agent_desktop_core::{AdapterError, DeliverySemantics, ErrorCode, NotificationInfo};
 
 use super::{dismiss_all_failures, dismiss_each_with};
+#[cfg(target_os = "windows")]
+use crate::notifications::actions::invoke_pattern;
 use crate::notifications::actions::{missing_dismiss_error, read_control};
 
 fn entry(index: usize, app: &str, title: &str) -> NotificationInfo {
@@ -166,4 +168,39 @@ fn a_mid_batch_read_failure_after_an_invoke_is_delivered_unverified() {
         .expect_err("the second listing fails");
 
     assert_eq!(error.disposition, DeliverySemantics::delivered_unverified());
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn a_pre_invoke_pattern_read_failure_keeps_the_batch_undispatched() {
+    let captured = vec![entry(1, "App A", "first")];
+    let mut invoke_errors = Vec::new();
+    let read_live = || {
+        Ok(captured
+            .iter()
+            .cloned()
+            .map(|info| (info, ()))
+            .collect::<Vec<_>>())
+    };
+    let invoke = |_: &(), _index: usize| {
+        invoke_pattern(Err(uiautomation::Error::new(
+            uiautomation::errors::ERR_INVALID_OBJECT,
+            "the dismiss control exposes no Invoke pattern",
+        )))
+    };
+
+    dismiss_each_with(&captured, read_live, invoke, &mut invoke_errors)
+        .expect("the batch records the pre-invoke failure and completes");
+
+    let failures = dismiss_all_failures(&captured, &captured, &invoke_errors);
+    assert_eq!(failures.len(), 1);
+    assert_eq!(
+        failures[0].disposition,
+        DeliverySemantics::not_delivered(),
+        "claiming the pattern sent nothing, so the batch never left not-delivered"
+    );
+    assert_eq!(
+        failures[0].disposition.retry(),
+        agent_desktop_core::RetryDisposition::Safe
+    );
 }

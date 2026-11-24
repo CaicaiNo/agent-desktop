@@ -143,7 +143,7 @@ REGISTRY: tuple[Leg, ...] = (
     Leg('text_entry.held_key_released', 'A held key is not left pressed', 'Text Editor', ('x11-openbox', 'x11-mutter'), ('headed',), ('atspi', 'x11'), 'pass', ''),
     Leg('text_entry.press_combos_edit_document', 'press return inserts one newline, ctrl+a then backspace empties the document, and no modifier stays down', 'Text Editor', ('x11-openbox', 'x11-mutter'), ('headed',), ('atspi', 'x11'), 'pass', ''),
     Leg('non_interference.active_window_unchanged_by_semantic_click', 'A semantic click leaves the active window and the pointer as they were', 'Calculator', ('x11-openbox', 'x11-mutter'), ('headless',), ('x11', 'atspi'), 'pass', ''),
-    Leg('lifecycle.close_app_undelivered_report', 'close-app reports not delivered when the process stays', 'Calculator', ('x11-openbox', 'x11-mutter'), ('headless',), ('x11', 'proc'), 'pass', ''),
+    Leg('lifecycle.close_app_undelivered_report', 'close-app reports not delivered when the process stays', 'Calculator', ('x11-openbox', 'x11-mutter'), HEADED, ('x11', 'proc'), 'pass', ''),
     Leg('lifecycle.focus_window_active_reads', 'focus-window makes the target active by the X11 reads', 'Calculator', ('x11-openbox', 'x11-mutter'), ('headed',), ('x11', 'proc'), 'pass', ''),
     Leg('lifecycle.minimize_restore', 'minimize and restore change the window state the oracle reads', 'Calculator', ('x11-openbox',), ('headless',), ('x11', 'proc'), 'pass', ''),
     Leg('lifecycle.maximize_restore', 'maximize and restore change the window state the oracle reads', 'Calculator', ('x11-openbox',), ('headless',), ('x11', 'proc'), 'pass', ''),
