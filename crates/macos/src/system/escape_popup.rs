@@ -56,8 +56,8 @@ impl TransientSurface for AxSurfaces {
     }
 }
 
-/// Closes the surface the process shows in `window`, or anywhere in the
-/// process when there is no window. `None` when none is open.
+/// Closes the surface `window` shows, or the one the process shows anywhere
+/// when `window` shows none or is absent. `None` when none is open.
 pub(crate) fn close_transient_surface(
     process: &ProcessIdentity,
     window: Option<&WindowInfo>,
@@ -90,17 +90,29 @@ fn close_with<S: TransientSurface>(
     process: &ProcessIdentity,
     window: Option<&WindowInfo>,
 ) -> Result<Option<ActionResult>, AdapterError> {
-    let found = match window {
-        Some(window) => surfaces.in_window(window)?,
-        None => surfaces.in_process(process)?,
-    };
-    let Some(surface) = found else {
+    let Some(surface) = find_surface(surfaces, process, window)? else {
         return Ok(None);
     };
     if !surfaces.cancel(&surface)? {
         return Ok(None);
     }
     Ok(Some(closed_result(action_step(surfaces.closed(&surface)))))
+}
+
+/// The surface inside the named window when that window shows one, otherwise
+/// the surface the process shows. Only the process is read without a window.
+fn find_surface<S: TransientSurface>(
+    surfaces: &S,
+    process: &ProcessIdentity,
+    window: Option<&WindowInfo>,
+) -> Result<Option<S::Surface>, AdapterError> {
+    let Some(window) = window else {
+        return surfaces.in_process(process);
+    };
+    match surfaces.in_window(window)? {
+        Some(surface) => Ok(Some(surface)),
+        None => surfaces.in_process(process),
+    }
 }
 
 fn action_step(verified: bool) -> ActionStep {
