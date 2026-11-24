@@ -30,7 +30,9 @@ const FOCUS_WAIT: Duration = Duration::from_millis(3_000);
 const SETTLE_GRACE: Duration = Duration::from_millis(150);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
-/// The window that owns the foreground and the process that owns that window.
+/// The window that owns the foreground and the application process behind it:
+/// the hosted application for a frame-hosted window, as window listing reports
+/// it (A26-8).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Foreground {
     pub handle: isize,
@@ -304,20 +306,23 @@ fn restore(prior: Foreground, lease: &InteractionLease, wait: Deadline) -> bool 
     focus_window(window, &lease).is_ok() && read_foreground() == Some(prior)
 }
 
+/// The foreground window with the process an agent means by it: the hosted
+/// application behind a frame host frame rather than the frame host, the same
+/// identity window listing reports (A26-8). Reading the raw window owner here
+/// would name `ApplicationFrameHost` for a hosted application, so a foreground
+/// a launch took from such a window would never match the window listing gives
+/// back, and the launch would be judged to own a window it does not.
 #[cfg(target_os = "windows")]
 pub(super) fn read_foreground() -> Option<Foreground> {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowThreadProcessId,
-    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
     let handle = unsafe { GetForegroundWindow() };
     if handle.is_null() {
         return None;
     }
-    let mut pid = 0u32;
-    unsafe { GetWindowThreadProcessId(handle, &mut pid) };
-    (pid != 0).then_some(Foreground {
+    let pid = crate::system::window::frame_identity::application_pid(handle)?;
+    Some(Foreground {
         handle: handle as isize,
-        pid,
+        pid: pid.get(),
     })
 }
 
