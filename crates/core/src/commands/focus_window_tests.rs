@@ -153,6 +153,43 @@ fn errors_when_focus_does_not_settle_on_requested_window() {
 }
 
 #[test]
+fn a_failed_confirmation_after_a_dispatch_that_sent_nothing_stays_not_delivered() {
+    let _clock = crate::wait::deadline::VirtualClock::freeze();
+    let target = window("w1", false);
+    let adapter = FocusAdapter {
+        windows: vec![target.clone()],
+        focused_windows: Mutex::new(Vec::new()),
+        focused_window_calls: Mutex::new(0),
+        focused_window_supported: true,
+        focus_sent: Mutex::new(false),
+        focused_before: false,
+        focus_delivery: DeliverySemantics::not_delivered(),
+    };
+
+    let err = execute(
+        FocusWindowArgs {
+            window_id: Some(target.id),
+            app: None,
+            title: None,
+        },
+        &adapter,
+        crate::InteractionPolicy::headed(),
+    )
+    .unwrap_err();
+
+    assert_eq!(err.code(), "ACTION_FAILED");
+    let crate::AppError::Adapter(error) = err else {
+        panic!("a focus settle failure is an adapter error");
+    };
+    assert_eq!(
+        error.disposition,
+        DeliverySemantics::not_delivered(),
+        "the adapter sent nothing, so the confirmation failure cannot be an unknown delivery"
+    );
+    assert_eq!(error.disposition.retry(), crate::RetryDisposition::Safe);
+}
+
+#[test]
 fn falls_back_to_focused_window_list_when_direct_observation_is_unsupported() {
     let target = window("w1", false);
     let adapter = FocusAdapter {
