@@ -20,7 +20,7 @@ pub(crate) fn observe<T>(
     })
 }
 
-fn require_generation(
+pub(crate) fn require_generation(
     identity: crate::system::process::process_identity::ProcessIdentity,
 ) -> Result<(), AdapterError> {
     if identity.still_matches()? {
@@ -353,6 +353,15 @@ fn invalid_root_error() -> AdapterError {
         "kind": "surface_root_invalid", "surface": "menubar", "complete": false,
         "retryable": false,
     }))
+}
+
+/// Whether a surface search stopped at its node budget, which means a surface
+/// may still sit below the cut rather than being absent.
+pub(crate) fn is_surface_search_limit(error: &AdapterError) -> bool {
+    error
+        .details
+        .as_ref()
+        .is_some_and(|details| details["kind"] == "surface_search_limit")
 }
 
 fn surface_limit_error() -> AdapterError {

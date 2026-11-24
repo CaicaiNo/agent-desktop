@@ -131,16 +131,34 @@ fn escape_reaches_the_focus_holder_first_then_the_open_surface() {
     use super::{SemanticKeyTarget, choose_key_target};
 
     assert_eq!(
-        choose_key_target(Some(1), "AXCancel", || panic!("surface read")),
+        choose_key_target(Some(1), "AXCancel", || panic!("surface read")).unwrap(),
         Some(SemanticKeyTarget::FocusHolder(1))
     );
     assert_eq!(
-        choose_key_target(None, "AXCancel", || Some(2)),
+        choose_key_target(None, "AXCancel", || Ok(Some(2))).unwrap(),
         Some(SemanticKeyTarget::OpenSurface(2))
     );
-    assert_eq!(choose_key_target::<u8>(None, "AXCancel", || None), None);
     assert_eq!(
-        choose_key_target::<u8>(None, "AXConfirm", || panic!("surface read")),
+        choose_key_target::<u8>(None, "AXCancel", || Ok(None)).unwrap(),
         None
     );
+    assert_eq!(
+        choose_key_target::<u8>(None, "AXConfirm", || panic!("surface read")).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn a_failed_surface_read_is_not_turned_into_an_absent_surface() {
+    use super::choose_key_target;
+
+    let error = choose_key_target::<u8>(None, "AXCancel", || {
+        Err(AdapterError::stale_ref_because(
+            "Application process instance changed during observation",
+        ))
+    })
+    .expect_err("a failed surface read must not read as no surface");
+
+    assert_eq!(error.code, ErrorCode::StaleRef);
+    assert_eq!(error.disposition, DeliverySemantics::not_delivered());
 }

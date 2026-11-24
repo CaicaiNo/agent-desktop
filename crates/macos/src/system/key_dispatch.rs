@@ -44,7 +44,7 @@ fn press_for_app(
         }
     }
     if let Some(action) = simple_key_action(combo)
-        && let Some(step) = deliver_semantic_key(pid, &app, action, deadline)?
+        && let Some(step) = deliver_semantic_key(identity, &app, action, deadline)?
     {
         return post_delivery_process_result(&process, step);
     }
@@ -98,23 +98,24 @@ enum SemanticKeyTarget<T> {
 }
 
 /// The states in the order they are tried: the focus holder, then, for
-/// Escape only, the open surface. None leaves the key its event route.
+/// Escape only, the open surface. `Ok(None)` leaves the key its event route,
+/// while a failed surface read propagates instead of reading as absent.
 fn choose_key_target<T>(
     focus_holder: Option<T>,
     action: &str,
-    open_surface: impl FnOnce() -> Option<T>,
-) -> Option<SemanticKeyTarget<T>> {
+    open_surface: impl FnOnce() -> Result<Option<T>, AdapterError>,
+) -> Result<Option<SemanticKeyTarget<T>>, AdapterError> {
     if let Some(holder) = focus_holder {
-        return Some(SemanticKeyTarget::FocusHolder(holder));
+        return Ok(Some(SemanticKeyTarget::FocusHolder(holder)));
     }
-    (action == CANCEL)
-        .then(open_surface)
-        .flatten()
-        .map(SemanticKeyTarget::OpenSurface)
+    if action != CANCEL {
+        return Ok(None);
+    }
+    Ok(open_surface()?.map(SemanticKeyTarget::OpenSurface))
 }
 
 fn semantic_key_target(
-    pid: i32,
+    identity: crate::system::process::process_identity::ProcessIdentity,
     app: &AXElement,
     action: &str,
     deadline: Deadline,
@@ -122,39 +123,51 @@ fn semantic_key_target(
     let focus_holder = focused_element(app, deadline)?.filter(|focused| {
         crate::actions::ax_helpers::advertises_action(focused, action, deadline) == Some(true)
     });
-    Ok(choose_key_target(focus_holder, action, || {
-        open_transient_surface(pid, deadline)
-    }))
+    choose_key_target(focus_holder, action, || {
+        open_transient_surface(identity, deadline)
+    })
 }
 
-/// The menu or popover the application shows. A read that cannot finish finds
-/// none, and the key then takes the route it had before.
-fn open_transient_surface(pid: i32, deadline: Deadline) -> Option<AXElement> {
-    crate::tree::surfaces::transient_surface_for_pid(pid, deadline)
-        .ok()
-        .flatten()
+/// The menu or popover the application shows. A search that reached its node
+/// limit finds none, and the key then takes the event route; every other read
+/// failure, including a changed process generation, propagates.
+fn open_transient_surface(
+    identity: crate::system::process::process_identity::ProcessIdentity,
+    deadline: Deadline,
+) -> Result<Option<AXElement>, AdapterError> {
+    match crate::tree::surfaces::transient_surface_for_process(identity, deadline) {
+        Ok(surface) => Ok(surface),
+        Err(error) if crate::tree::app_menu::is_surface_search_limit(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
-/// Performs the action on the target the key reaches. A closed surface is
-/// verified by reading that it is gone.
+/// Performs the action on the target the key reaches. The process generation is
+/// revalidated immediately before the action, and an open surface must belong to
+/// that process. A closed surface is verified by reading that it is gone.
 fn deliver_semantic_key(
-    pid: i32,
+    identity: crate::system::process::process_identity::ProcessIdentity,
     app: &AXElement,
     action: &'static str,
     deadline: Deadline,
 ) -> Result<Option<ActionStep>, AdapterError> {
-    let Some(target) = semantic_key_target(pid, app, action, deadline)? else {
+    let Some(target) = semantic_key_target(identity, app, action, deadline)? else {
         return Ok(None);
     };
     match &target {
         SemanticKeyTarget::FocusHolder(element) => {
+            crate::tree::app_menu::require_generation(identity).map_err(not_delivered)?;
             if !crate::actions::ax_helpers::try_ax_action_or_err(element, action, deadline)? {
                 return Ok(None);
             }
             Ok(Some(semantic_step(action)))
         }
-        SemanticKeyTarget::OpenSurface(element) => cancel_surface(element, deadline),
+        SemanticKeyTarget::OpenSurface(element) => cancel_surface(identity, element, deadline),
     }
+}
+
+fn not_delivered(error: AdapterError) -> AdapterError {
+    error.with_disposition(DeliverySemantics::not_delivered())
 }
 
 fn uses_menu_shortcut(combo: &KeyCombo, policy: InteractionPolicy) -> bool {
