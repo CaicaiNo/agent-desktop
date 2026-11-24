@@ -104,17 +104,10 @@ impl SystemOps for WindowsAdapter {
         true
     }
 
-    /// The surfaces this adapter can observe: a named window, the focused
-    /// window, a Chromium modal-as-sheet, an open application menu, and the
-    /// shell kinds the shell-surface resolver reaches on this build. Core
-    /// validates the requested surface against this list before the adapter
-    /// is ever called (the mirror of macOS `supported_surfaces`), so a kind
-    /// advertised here always has a matching `surface_root` arm - advertising
-    /// without an arm would convert the old emit/advertise asymmetry into an
-    /// advertise/resolve one. `quick-settings` is deliberately absent: this
-    /// build carries the quick actions inside the Action Center, so the kind
-    /// refuses in core with the standard shape instead of pretending it can
-    /// root.
+    /// The surfaces this adapter can observe. Core validates a requested
+    /// surface against this list before calling the adapter, so every kind here
+    /// has a matching `surface_root` arm; `quick-settings` is absent because
+    /// this build carries the quick actions inside the Action Center.
     fn supported_surfaces(&self) -> Vec<SnapshotSurface> {
         vec![
             SnapshotSurface::Window,
