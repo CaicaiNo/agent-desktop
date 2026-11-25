@@ -141,6 +141,27 @@ On macOS, application-owned `menu` and `menubar` snapshots omit `data.window`. `
 
 A complete macOS menu lookup with no surface returns `ELEMENT_NOT_FOUND` with `details.kind: "surface_absent"`, `details.surface: "menu"` or `"menubar"`, and `details.complete: true`. That is completed absence evidence. An absent `menubar` can mean the application exposes no menu bar. A `menu` lookup requires an open menu: snapshot `menubar` when it exists, click its owning item without `--headed`, then snapshot `--surface menu`. Missing `complete`, `complete: false`, a timeout, or an incomplete AX read leaves the result unknown, not absent. If a prior action has `delivery_uncertain` and `retry: unsafe`, inspect the current UI before any action; do not repeat the action.
 
+### Menu origin
+
+A `menu` snapshot can name the delivery that opened the menu it read. The driver records every `right-click` it delivers together with what menu, if any, was open immediately before it, and a later menu read carries `data.origin`, plus the same ref as `data.origin_ref` for callers that read a bare string.
+
+Attribution needs all of: a delivery the driver performed, a conclusive answer about what was on screen before it, a menu that is not the one that predates it, the same application and process generation, and a proof less than two minutes old. A menu opened outside the driver, a right click whose menu was already standing, an unreadable menu before a delivery, or a restarted application all omit both fields. Absence is unproven, not absent: a caller that needs provenance must refuse to act, and position or item geometry never stands in for it.
+
+| Field | Meaning |
+| --- | --- |
+| `origin_ref` | The ref the right click was delivered to, repeated at the top level. |
+| `ref_id` | The same ref, inside `data.origin`. |
+| `app`, `pid`, `process_instance` | The application that owns the menu and the process generation the delivery was made in. |
+| `window_id` | The window of the clicked ref, when it came from one. |
+| `surface` | Always `menu`. |
+| `delivery` | The delivery kind, `right-click`. |
+| `sequence` | The delivery's position in this state root's ledger. |
+| `delivered_at_ms` | When the delivery returned, in Unix milliseconds. |
+| `instance` | An opaque id for this appearance of the menu: the platform element token, hashed, or a digest of the menu structure when the platform exposes no token. |
+| `instance_basis` | `remote_token` or `structure`, so a caller can tell how strong the identity is. |
+| `prior` | What was on screen before the delivery: `none`, `open`, or `unknown`. |
+| `proof` | Always `fresh_after_delivery`: the menu read is not the one that predates the delivery. |
+
 - Focus and preparatory scrolling can change coordinates. Stability is verified against fresh live observations, not by requiring coordinates to remain equal to the original snapshot.
 - On macOS, clicking an item in the native menu bar uses `AXPress`. It works headless, and under `--headed` it does not move the pointer. A headless `right-click` can use `AXShowMenu` when the target provides it.
 
