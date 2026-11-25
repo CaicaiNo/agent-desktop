@@ -12,8 +12,10 @@ const MENU_DEPTH: u8 = 6;
 pub(crate) enum MenuRead {
     /// A complete read proved no menu is open.
     Absent,
-    /// A complete read observed this menu.
+    /// A complete read observed this menu, and the platform named its element.
     Observed(MenuInstance),
+    /// A complete read observed a menu the platform did not name.
+    Unidentified,
     /// The read could not answer, so nothing may be concluded either way.
     Unknown,
 }
@@ -39,8 +41,11 @@ pub(crate) fn observe(adapter: &dyn PlatformAdapter, app: &str, deadline: Deadli
         force_renderer_accessibility: false,
     };
     match snapshot::build(adapter, &opts, Some(app), None, deadline) {
-        Ok(result) if result.complete => MenuRead::Observed(instance::of_tree(&result.tree)),
-        Ok(_) => MenuRead::Unknown,
+        Ok(result) if !result.complete => MenuRead::Unknown,
+        Ok(result) => match instance::of_tree(&result.tree) {
+            Some(menu) => MenuRead::Observed(menu),
+            None => MenuRead::Unidentified,
+        },
         Err(crate::AppError::Adapter(error))
             if error.is_confirmed_surface_absence(SnapshotSurface::Menu) =>
         {

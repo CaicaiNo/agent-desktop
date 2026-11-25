@@ -1,113 +1,53 @@
 //! Provenance for the application-owned `menu` surface.
 //!
 //! A menu answer names the application that owns it and nothing about how it
-//! came to be open, so a caller that opened a menu by acting on a row cannot
-//! tell its own menu from one that was already there. This module closes that
-//! gap with evidence the driver alone holds: every right click it delivers is
-//! recorded together with what menu, if any, was on screen immediately before,
-//! and a later menu read is attributed to that delivery only when the menu it
-//! observes is not the one that predates it.
+//! came to be open, so a caller that opened a menu by right-clicking a row
+//! cannot tell its own menu from one that was already there. This module closes
+//! that gap with evidence the driver alone holds: the right click publishes
+//! itself, reads the menu on the way in, and fixes the menu instance it
+//! produced; a later menu read is attributed to that delivery only while the
+//! menu on screen is the very instance it fixed.
 //!
-//! Nothing here is inferred from where the menu is drawn. Two menus can share a
-//! position and a set of items, so geometry and item lists never stand in for
-//! the delivery that opened one.
+//! Nothing here is inferred from where the menu is drawn, and nothing is
+//! inferred from what the menu shows: two openings look identical, so only a
+//! platform element token can tell them apart.
 
 mod instance;
 mod ledger;
 mod probe;
 mod store;
+mod witness;
 
-pub(crate) use ledger::PriorMenu;
+pub(crate) use witness::MenuWitness;
 
-use crate::{
-    CommandContext, PlatformAdapter, ProcessId, RefEntry, SnapshotSurface, snapshot::SnapshotResult,
-};
+use crate::{CommandContext, ProcessId, SnapshotSurface, snapshot::SnapshotResult};
 use serde_json::{Value, json};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use instance::MenuInstance;
 use ledger::MenuDelivery;
-use probe::MenuRead;
 use store::MenuLedgerStore;
 
-const PRE_READ_MS: u64 = 400;
+const DELIVERY_PREFIX: &str = "dlv1:";
 const DELIVERY: &str = "right-click";
+static DELIVERY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// A right click the driver is about to deliver, with the menu evidence taken
-/// on the way in.
-pub(crate) struct PendingDelivery {
-    origin_ref: String,
-    app: String,
-    pid: ProcessId,
-    process_instance: Option<String>,
-    window_id: Option<String>,
-    prior: PriorMenu,
-    prior_instance: Option<String>,
-}
-
-/// Reads the menu state a right click on `ref_id` is about to change.
+/// A fresh id for one delivery attempt.
 ///
-/// Returns `None` when the platform serves no menu surface or the ref does not
-/// name the application it belongs to: without either, no delivery can ever be
-/// attributed, so nothing is recorded. A read that fails is not treated as
-/// "no menu open" — it records that the prior state is unknown, and an unknown
-/// prior state attributes nothing later.
-pub(crate) fn prepare(
-    adapter: &dyn PlatformAdapter,
-    ref_id: &str,
-    entry: &RefEntry,
-) -> Option<PendingDelivery> {
-    if adapter
-        .check_surface_support(SnapshotSurface::Menu)
-        .is_err()
-    {
-        return None;
-    }
-    let app = entry.source.source_app.clone()?;
-    let deadline = crate::Deadline::after(PRE_READ_MS).ok()?;
-    let read = probe::observe(adapter, &app, deadline);
-    let (prior, prior_instance) = match read {
-        MenuRead::Absent => (PriorMenu::None, None),
-        MenuRead::Observed(instance) => (PriorMenu::Open, Some(instance.id().to_owned())),
-        MenuRead::Unknown => (PriorMenu::Unknown, None),
-    };
-    Some(PendingDelivery {
-        origin_ref: ref_id.to_owned(),
-        app,
-        pid: entry.process.pid,
-        process_instance: entry.process.process_instance.clone(),
-        window_id: entry.source.source_window_id.clone(),
-        prior,
-        prior_instance,
-    })
+/// It must differ between two runs of the same command in the same millisecond,
+/// so it mixes the clock, a per-process counter and the process id.
+pub(crate) fn new_delivery_id() -> String {
+    let counter = DELIVERY_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let mut bytes = Vec::with_capacity(28);
+    bytes.extend_from_slice(&nanos.to_le_bytes());
+    bytes.extend_from_slice(&counter.to_le_bytes());
+    bytes.extend_from_slice(&std::process::id().to_le_bytes());
+    format!("{DELIVERY_PREFIX}{:016x}", instance::digest(&bytes))
 }
 
-/// Records the delivery `prepare` saw, whatever it delivered.
-///
-/// A failed or unproven delivery is recorded too: it supersedes the proof of an
-/// earlier one, so a menu that survived a delivery nobody could attribute is
-/// never attributed to the delivery before it.
-pub(crate) fn finish(pending: Option<PendingDelivery>, delivered: bool, context: &CommandContext) {
-    let Some(pending) = pending else {
-        return;
-    };
-    let Ok(store) = MenuLedgerStore::for_session(context.session_id()) else {
-        return;
-    };
-    let _ = store.record(MenuDelivery {
-        sequence: 0,
-        origin_ref: pending.origin_ref,
-        app: pending.app,
-        pid: pending.pid,
-        process_instance: pending.process_instance,
-        window_id: pending.window_id,
-        delivered_at_ms: now_ms(),
-        delivered,
-        prior: pending.prior,
-        prior_instance: pending.prior_instance,
-    });
-}
-
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| {
@@ -118,8 +58,8 @@ fn now_ms() -> u64 {
 /// Adds the menu's provenance to a menu-surface snapshot answer.
 ///
 /// The answer keeps its shape when nothing can be attributed: an absent
-/// `origin` is the caller's signal that the menu it read has no recorded
-/// delivery behind it, and a caller that needs one refuses to act.
+/// `origin` is the caller's signal that the menu it read is not the instance any
+/// recorded delivery fixed, and a caller that needs that proof refuses to act.
 pub(crate) fn annotate(
     body: &mut Value,
     result: &SnapshotResult,
@@ -129,21 +69,32 @@ pub(crate) fn annotate(
     if surface != SnapshotSurface::Menu || !result.complete {
         return;
     }
+    let Some(observed) = instance::of_tree(&result.tree) else {
+        return;
+    };
     let Some((app, pid, process_instance)) = owner_identity(result) else {
         return;
     };
     let Ok(store) = MenuLedgerStore::for_session(context.session_id()) else {
         return;
     };
-    let observed = instance::of_tree(&result.tree);
-    let ledger = store.load();
+    let now_ms = now_ms();
+    let ledger = store.load(now_ms);
     let Some(delivery) =
-        ledger.origin_for(&observed, &app, pid, process_instance.as_deref(), now_ms())
+        ledger.attribution(&observed, &app, pid, process_instance.as_deref(), now_ms)
     else {
         return;
     };
+    let mut origin = json!({ "surface": SnapshotSurface::Menu.as_str(), "delivery": DELIVERY });
+    delivery_fields(
+        &mut origin,
+        delivery,
+        delivery.instance.as_deref().unwrap_or_default(),
+        delivery.settled_at_ms.unwrap_or(delivery.started_at_ms),
+    );
+    origin["proof"] = json!("fresh_after_delivery");
     body["origin_ref"] = json!(delivery.origin_ref);
-    body["origin"] = origin_json(delivery, &observed);
+    body["origin"] = origin;
 }
 
 fn owner_identity(result: &SnapshotResult) -> Option<(String, ProcessId, Option<String>)> {
@@ -159,29 +110,53 @@ fn owner_identity(result: &SnapshotResult) -> Option<(String, ProcessId, Option<
     }
 }
 
-fn origin_json(delivery: &MenuDelivery, observed: &MenuInstance) -> Value {
-    let mut origin = json!({
-        "ref_id": delivery.origin_ref,
-        "app": delivery.app,
-        "pid": delivery.pid.get(),
-        "surface": SnapshotSurface::Menu.as_str(),
-        "delivery": DELIVERY,
-        "sequence": delivery.sequence,
-        "delivered_at_ms": delivery.delivered_at_ms,
-        "instance": observed.id(),
-        "instance_basis": observed.basis().as_str(),
-        "prior": delivery.prior,
-        "proof": "fresh_after_delivery",
-    });
+/// The fields a receipt and a proven `origin` share.
+pub(crate) fn delivery_fields(
+    value: &mut Value,
+    delivery: &MenuDelivery,
+    instance: &str,
+    delivered_at_ms: u64,
+) {
+    value["delivery_id"] = json!(delivery.delivery_id);
+    value["ref_id"] = json!(delivery.origin_ref);
+    value["instance"] = json!(instance);
+    value["app"] = json!(delivery.app);
+    value["pid"] = json!(delivery.pid.get());
+    value["prior"] = json!(delivery.prior);
+    value["sequence"] = json!(delivery.sequence);
+    value["delivered_at_ms"] = json!(delivered_at_ms);
     if let Some(process_instance) = delivery.process_instance.as_deref() {
-        origin["process_instance"] = json!(process_instance);
+        value["process_instance"] = json!(process_instance);
     }
     if let Some(window_id) = delivery.window_id.as_deref() {
-        origin["window_id"] = json!(window_id);
+        value["window_id"] = json!(window_id);
     }
-    origin
+}
+
+/// Rebuilds the receipt of a delivery the witness just proved.
+pub(crate) fn receipt(delivery: &MenuDelivery, delivered_at_ms: u64) -> Value {
+    let mut value = json!({ "delivery": DELIVERY });
+    delivery_fields(
+        &mut value,
+        delivery,
+        delivery.instance.as_deref().unwrap_or_default(),
+        delivered_at_ms,
+    );
+    value
 }
 
 #[cfg(test)]
 #[path = "menu_origin_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "menu_flow_fixture_tests.rs"]
+mod flow_fixture_tests;
+
+#[cfg(test)]
+#[path = "menu_flow_tests.rs"]
+mod flow_tests;
+
+#[cfg(test)]
+#[path = "menu_flow_state_tests.rs"]
+mod flow_state_tests;
